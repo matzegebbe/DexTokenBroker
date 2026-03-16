@@ -1,0 +1,543 @@
+package tokenbroker
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Config struct {
+	DexTokenURL          string
+	HTTPTimeout          time.Duration
+	CacheCleanupInterval time.Duration
+	ExpirySafetyMargin   time.Duration
+	AllowInsecureDexURL  bool
+}
+
+type Service struct {
+	cache                *tokenCache
+	flights              *flightGroup
+	logger               *slog.Logger
+	httpClient           *http.Client
+	dexTokenURL          string
+	cacheCleanupInterval time.Duration
+	expirySafetyMargin   time.Duration
+}
+
+type oauthTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+}
+
+type cachedToken struct {
+	Token     string
+	ExpiresAt time.Time
+}
+
+const (
+	maxClientIDLength     = 256
+	maxClientSecretLength = 4096
+	maxScopeLength        = 1024
+	maxTokenResponseSize  = 64 * 1024
+)
+
+func New(cfg Config, logger *slog.Logger) (*Service, error) {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+
+	timeout := cfg.HTTPTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	cleanupInterval := cfg.CacheCleanupInterval
+	if cleanupInterval <= 0 {
+		cleanupInterval = 5 * time.Minute
+	}
+
+	expiryMargin := cfg.ExpirySafetyMargin
+	if expiryMargin <= 0 {
+		expiryMargin = 30 * time.Second
+	}
+
+	dexTokenURL, err := validateDexTokenURL(cfg.DexTokenURL, cfg.AllowInsecureDexURL)
+	if err != nil {
+		return nil, err
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = timeout
+	transport.ExpectContinueTimeout = time.Second
+	transport.MaxIdleConns = 16
+	transport.MaxIdleConnsPerHost = 8
+	transport.MaxConnsPerHost = 32
+
+	return &Service{
+		cache:                newTokenCache(),
+		flights:              newFlightGroup(),
+		logger:               logger,
+		httpClient:           &http.Client{Timeout: timeout, Transport: transport},
+		dexTokenURL:          dexTokenURL,
+		cacheCleanupInterval: cleanupInterval,
+		expirySafetyMargin:   expiryMargin,
+	}, nil
+}
+
+func (s *Service) StartJanitor(ctx context.Context) {
+	s.cache.StartJanitor(ctx, s.cacheCleanupInterval, s.logger)
+}
+
+func (s *Service) HealthHandler(w http.ResponseWriter, _ *http.Request) {
+	setCommonResponseHeaders(w)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
+}
+
+func (s *Service) CheckHandler(w http.ResponseWriter, r *http.Request) {
+	setCommonResponseHeaders(w)
+	defer r.Body.Close()
+
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	clientID := strings.TrimSpace(r.Header.Get("x-client-id"))
+	clientSecret := r.Header.Get("x-client-secret")
+	scope := strings.TrimSpace(r.Header.Get("x-scope"))
+
+	if err := validateInboundHeaders(clientID, clientSecret, scope); err != nil {
+		var requestErr *tokenRequestError
+		if errors.As(err, &requestErr) {
+			http.Error(w, requestErr.Message, requestErr.StatusCode)
+			return
+		}
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	cacheKey := buildCacheKey(clientID, clientSecret, scope)
+
+	if entry, ok := s.cache.Get(cacheKey); ok {
+		s.writeAuthorized(w, entry.Token)
+		return
+	}
+
+	token, err := s.flights.Do(cacheKey, func() (string, error) {
+		if entry, ok := s.cache.Get(cacheKey); ok {
+			return entry.Token, nil
+		}
+
+		response, err := s.requestToken(r.Context(), clientID, clientSecret, scope)
+		if err != nil {
+			return "", err
+		}
+
+		s.cache.Set(cacheKey, response.AccessToken, s.computeExpiry(response.ExpiresIn))
+
+		return response.AccessToken, nil
+	})
+	if err != nil {
+		var requestErr *tokenRequestError
+		if errors.As(err, &requestErr) {
+			s.logger.Warn(
+				"token request failed",
+				"client_id", clientID,
+				"scope", scope,
+				"status_code", requestErr.StatusCode,
+				"error", requestErr.Cause,
+			)
+			http.Error(w, requestErr.Message, requestErr.StatusCode)
+			return
+		}
+
+		s.logger.Error("unexpected token error", "client_id", clientID, "scope", scope, "error", err)
+		http.Error(w, "token request failed", http.StatusUnauthorized)
+		return
+	}
+
+	s.writeAuthorized(w, token)
+}
+
+func (s *Service) writeAuthorized(w http.ResponseWriter, accessToken string) {
+	setCommonResponseHeaders(w)
+	w.Header().Set("Authorization", "Bearer "+accessToken)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Service) requestToken(ctx context.Context, clientID, clientSecret, scope string) (oauthTokenResponse, error) {
+	form := url.Values{}
+	form.Set("grant_type", "client_credentials")
+
+	if scope != "" {
+		form.Set("scope", scope)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.dexTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return oauthTokenResponse{}, &tokenRequestError{
+			StatusCode: http.StatusInternalServerError,
+			Message:    "failed to build token request",
+			Cause:      err,
+		}
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(clientID, clientSecret)
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return oauthTokenResponse{}, &tokenRequestError{
+			StatusCode: http.StatusServiceUnavailable,
+			Message:    "oauth provider unavailable",
+			Cause:      err,
+		}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponseSize+1))
+	if err != nil {
+		return oauthTokenResponse{}, &tokenRequestError{
+			StatusCode: http.StatusBadGateway,
+			Message:    "failed to read token response",
+			Cause:      err,
+		}
+	}
+
+	if len(body) > maxTokenResponseSize {
+		return oauthTokenResponse{}, &tokenRequestError{
+			StatusCode: http.StatusBadGateway,
+			Message:    "token response too large",
+			Cause:      errors.New("oauth response exceeded size limit"),
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return oauthTokenResponse{}, &tokenRequestError{
+			StatusCode: mapUpstreamStatus(resp.StatusCode),
+			Message:    "token request failed",
+			Cause:      fmt.Errorf("oauth provider returned %s: %s", resp.Status, truncateBody(body)),
+		}
+	}
+
+	var token oauthTokenResponse
+	if err := json.Unmarshal(body, &token); err != nil {
+		return oauthTokenResponse{}, &tokenRequestError{
+			StatusCode: http.StatusBadGateway,
+			Message:    "invalid token response",
+			Cause:      err,
+		}
+	}
+
+	if err := validateTokenResponse(token); err != nil {
+		return oauthTokenResponse{}, &tokenRequestError{
+			StatusCode: http.StatusBadGateway,
+			Message:    "invalid token response",
+			Cause:      err,
+		}
+	}
+
+	return token, nil
+}
+
+func (s *Service) computeExpiry(expiresIn int) time.Time {
+	now := time.Now()
+
+	if expiresIn <= 0 {
+		return now.Add(60 * time.Second)
+	}
+
+	lifetime := time.Duration(expiresIn) * time.Second
+	margin := s.expirySafetyMargin
+	if lifetime <= margin {
+		margin = lifetime / 5
+		if margin <= 0 {
+			margin = time.Second
+		}
+	}
+
+	return now.Add(lifetime - margin)
+}
+
+func validateDexTokenURL(rawURL string, allowInsecure bool) (string, error) {
+	if rawURL == "" {
+		return "", errors.New("dex token url must not be empty")
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse dex token url: %w", err)
+	}
+
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return "", fmt.Errorf("dex token url scheme must be http or https: %q", parsed.Scheme)
+	}
+
+	if parsed.Scheme != "https" && !allowInsecure {
+		return "", errors.New("dex token url must use https unless ALLOW_INSECURE_DEX_URL=true")
+	}
+
+	if parsed.Host == "" {
+		return "", errors.New("dex token url host must not be empty")
+	}
+
+	return parsed.String(), nil
+}
+
+func validateInboundHeaders(clientID, clientSecret, scope string) error {
+	if clientID == "" || clientSecret == "" {
+		return &tokenRequestError{
+			StatusCode: http.StatusUnauthorized,
+			Message:    "missing credentials",
+		}
+	}
+
+	if len(clientID) > maxClientIDLength {
+		return &tokenRequestError{
+			StatusCode: http.StatusBadRequest,
+			Message:    "x-client-id too long",
+		}
+	}
+
+	if len(clientSecret) > maxClientSecretLength {
+		return &tokenRequestError{
+			StatusCode: http.StatusBadRequest,
+			Message:    "x-client-secret too long",
+		}
+	}
+
+	if len(scope) > maxScopeLength {
+		return &tokenRequestError{
+			StatusCode: http.StatusBadRequest,
+			Message:    "x-scope too long",
+		}
+	}
+
+	if hasInvalidHeaderValue(clientID) || hasInvalidHeaderValue(clientSecret) || hasInvalidHeaderValue(scope) {
+		return &tokenRequestError{
+			StatusCode: http.StatusBadRequest,
+			Message:    "header contains invalid characters",
+		}
+	}
+
+	return nil
+}
+
+func validateTokenResponse(token oauthTokenResponse) error {
+	if token.AccessToken == "" {
+		return errors.New("empty access_token")
+	}
+
+	if hasInvalidHeaderValue(token.AccessToken) {
+		return errors.New("access_token contains invalid header characters")
+	}
+
+	if token.TokenType != "" && !strings.EqualFold(token.TokenType, "Bearer") {
+		return fmt.Errorf("unsupported token_type %q", token.TokenType)
+	}
+
+	return nil
+}
+
+func buildCacheKey(clientID, clientSecret, scope string) string {
+	sum := sha256.Sum256([]byte(clientSecret))
+	return strings.Join([]string{
+		clientID,
+		scope,
+		hex.EncodeToString(sum[:]),
+	}, "|")
+}
+
+func mapUpstreamStatus(statusCode int) int {
+	switch {
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusBadRequest:
+		return http.StatusUnauthorized
+	case statusCode >= 500:
+		return http.StatusBadGateway
+	default:
+		return http.StatusUnauthorized
+	}
+}
+
+func truncateBody(body []byte) string {
+	const limit = 256
+
+	value := strings.TrimSpace(string(body))
+	if len(value) <= limit {
+		return value
+	}
+
+	return value[:limit] + "..."
+}
+
+func hasInvalidHeaderValue(value string) bool {
+	for _, r := range value {
+		if r == '\r' || r == '\n' {
+			return true
+		}
+
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+
+	return false
+}
+
+func setCommonResponseHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
+type tokenRequestError struct {
+	StatusCode int
+	Message    string
+	Cause      error
+}
+
+func (e *tokenRequestError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Cause == nil {
+		return e.Message
+	}
+	return fmt.Sprintf("%s: %v", e.Message, e.Cause)
+}
+
+type tokenCache struct {
+	mu    sync.RWMutex
+	items map[string]cachedToken
+}
+
+func newTokenCache() *tokenCache {
+	return &tokenCache{
+		items: make(map[string]cachedToken),
+	}
+}
+
+func (c *tokenCache) Get(key string) (cachedToken, bool) {
+	now := time.Now()
+
+	c.mu.RLock()
+	entry, ok := c.items[key]
+	c.mu.RUnlock()
+
+	if !ok {
+		return cachedToken{}, false
+	}
+
+	if now.After(entry.ExpiresAt) {
+		c.mu.Lock()
+		current, exists := c.items[key]
+		if exists && now.After(current.ExpiresAt) {
+			delete(c.items, key)
+		}
+		c.mu.Unlock()
+		return cachedToken{}, false
+	}
+
+	return entry, true
+}
+
+func (c *tokenCache) Set(key, token string, expiresAt time.Time) {
+	c.mu.Lock()
+	c.items[key] = cachedToken{
+		Token:     token,
+		ExpiresAt: expiresAt,
+	}
+	c.mu.Unlock()
+}
+
+func (c *tokenCache) CleanupExpired() (removed int, remaining int) {
+	now := time.Now()
+
+	c.mu.Lock()
+	for key, entry := range c.items {
+		if now.After(entry.ExpiresAt) {
+			delete(c.items, key)
+			removed++
+		}
+	}
+	remaining = len(c.items)
+	c.mu.Unlock()
+
+	return removed, remaining
+}
+
+func (c *tokenCache) StartJanitor(ctx context.Context, interval time.Duration, logger *slog.Logger) {
+	if interval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+
+	go func() {
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				removed, remaining := c.CleanupExpired()
+				if removed > 0 {
+					logger.Info("cache cleanup completed", "removed", removed, "remaining", remaining)
+				}
+			}
+		}
+	}()
+}
+
+type flightGroup struct {
+	mu    sync.Mutex
+	calls map[string]*flightCall
+}
+
+type flightCall struct {
+	done  chan struct{}
+	token string
+	err   error
+}
+
+func newFlightGroup() *flightGroup {
+	return &flightGroup{
+		calls: make(map[string]*flightCall),
+	}
+}
+
+func (g *flightGroup) Do(key string, fn func() (string, error)) (string, error) {
+	g.mu.Lock()
+	if call, ok := g.calls[key]; ok {
+		g.mu.Unlock()
+		<-call.done
+		return call.token, call.err
+	}
+
+	call := &flightCall{done: make(chan struct{})}
+	g.calls[key] = call
+	g.mu.Unlock()
+
+	call.token, call.err = fn()
+	close(call.done)
+
+	g.mu.Lock()
+	delete(g.calls, key)
+	g.mu.Unlock()
+
+	return call.token, call.err
+}
