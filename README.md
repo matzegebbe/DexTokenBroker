@@ -1,6 +1,8 @@
-# DexTokenBroker
-
-Trading OAuth2 tokens from Dex for Envoy Gateway.
+<div align="center">
+  <img src="dex_token_broker_logo.png" alt="DexTokenBroker logo" width="360">
+  <h1>DexTokenBroker</h1>
+  <p>Trading OAuth2 tokens from Dex for Envoy Gateway.</p>
+</div>
 
 DexTokenBroker is a lightweight external authorization service for Envoy Gateway. It performs OAuth2 `client_credentials` requests against Dex, caches access tokens in memory, and returns `Authorization: Bearer ...` headers that Envoy can forward to backend services.
 
