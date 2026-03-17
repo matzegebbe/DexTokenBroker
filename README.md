@@ -1,6 +1,6 @@
 <div align="center">
   <img src="dex_token_broker_logo.png" alt="DexTokenBroker logo" width="360">
-  <h1>DexTokenBroker</h1>
+  <h1>Dex Token Broker</h1>
   <p>Trading OAuth2 tokens from Dex for Envoy Gateway.</p>
 </div>
 
