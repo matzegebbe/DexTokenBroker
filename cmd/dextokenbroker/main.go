@@ -60,6 +60,7 @@ func run() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/check", service.CheckHandler)
+	mux.HandleFunc("/check/", service.CheckHandler)
 	mux.HandleFunc("/healthz", service.HealthHandler)
 
 	server := &http.Server{
