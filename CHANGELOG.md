@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/matzegebbe/dex-token-broker/compare/v0.5.0...v0.6.0) (2026-04-09)
+
+
+### Features
+
+* allow setting static credentials independently ([#24](https://github.com/matzegebbe/dex-token-broker/issues/24)) ([c2cc7f7](https://github.com/matzegebbe/dex-token-broker/commit/c2cc7f7e4479da3b4c36af210b8d4183fd1b92cf))
+
 ## [0.5.0](https://github.com/matzegebbe/dex-token-broker/compare/v0.4.1...v0.5.0) (2026-04-07)
 
 
